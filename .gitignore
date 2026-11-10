@@ -4,3 +4,10 @@ __pycache__/
 *.pem
 *.img
 *.sig
+
+*.img.xz
+*.key
+snmp.conf
+auth.sha256
+admin-password
+install-device.json

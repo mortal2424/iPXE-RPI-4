@@ -4,16 +4,21 @@ services:
     image: pi-fleet:local
     ports:
       - "${FLEET_IP}:80:8084"
-    command: ["panel.py", "--bind", "0.0.0.0", "--port", "8084", "--origin", "http://${FLEET_IP}", "--network", "${FLEET_NETWORK}", "--database", "/state/devices.db"]
+      - "${FLEET_IP}:443:8443"
+    command: ["panel.py", "--bind", "0.0.0.0", "--port", "8084", "--origin", "http://${FLEET_IP}", "--network", "${FLEET_NETWORK}", "--database", "/state/devices.db", "--test-pi", "${FLEET_TEST_PI}", "--https-origin", "https://${FLEET_IP}", "--tls-dir", "/tls", "--switch-config", "/switch"]
     cap_drop: [ALL]
     volumes:
       - ${FLEET_STATE}:/state
+      - ${FLEET_TLS_DIR:-/srv/pi-reinstall/tls}:/tls:ro
+      - ${FLEET_SWITCH_CONFIG:-/srv/pi-reinstall/switch}:/switch:ro
     restart: unless-stopped
   boot:
     image: pi-fleet:local
     network_mode: host
-    command: ["boot-http.py", "--bind", "${FLEET_IP}", "--client", "${FLEET_TEST_PI}", "--directory", "/boot-files"]
+    command: ["boot-http.py", "--bind", "${FLEET_IP}", "--client", "${FLEET_TEST_PI}", "--directory", "/boot-files", "--jobs", "/jobs"]
     cap_drop: [ALL]
     volumes:
-      - ${FLEET_BOOT_FILES}:/boot-files:ro
+      - ${FLEET_BOOT_FILES}/boot:/boot-files/boot:ro
+      - ${FLEET_BOOT_FILES}/images:/boot-files/images:ro
+      - ${FLEET_STATE}/jobs:/jobs
     restart: unless-stopped

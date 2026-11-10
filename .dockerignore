@@ -1,3 +1,7 @@
 *
 !panel.py
 !boot-http.py
+
+!telemetry.py
+!poe.py
+!reinstall.py

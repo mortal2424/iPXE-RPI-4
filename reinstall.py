@@ -94,7 +94,10 @@ def process(db, base, state, settings, request):
     ip, image, hostname, login, password_hash = request
     if ip != str(ipaddress.IPv4Address(settings["ip"])):
         raise ValueError("Pi is not registered for installation")
-    cid, mac = settings["cid"], settings["mac"]
+    device = db.execute("SELECT physical_port, sd_cid FROM devices WHERE ip=?", (ip,)).fetchone()
+    if not device or device[0] != settings["port"] or not device[1]:
+        raise ValueError("SD card or verified port not registered")
+    cid, mac = device[1], settings["mac"]
     if not re.fullmatch(r"[a-f0-9]{32}", cid) or not re.fullmatch(r"(?:[a-f0-9]{2}:){5}[a-f0-9]{2}", mac):
         raise ValueError("Invalid device identity")
     server = str(ipaddress.IPv4Address(settings["server"]))

@@ -138,6 +138,8 @@ def install_busy(database):
 
 
 def render_power(server, ip, physical_port):
+    if physical_port is None:
+        return '<div class="job power"><b>Питание</b><span>Управляется вручную</span></div>'
     if ip not in server.switch.ports or server.switch.ports[ip][0] != physical_port:
         return '<small>Управление PoE ожидает проверки порта.</small>'
     try:
@@ -167,7 +169,7 @@ def render_power(server, ip, physical_port):
 
 
 def render_card(device, samples, metrics, installer, power, admin, ready_images):
-    ip, name, image, boot, physical_port = device
+    ip, name, image, boot, physical_port, cid = device
     last = samples[0] if samples else None
     online = last and last[1]
     state = "SSH доступен" if online else "SSH недоступен" if last else "Ожидает проверки"
@@ -190,10 +192,20 @@ def render_card(device, samples, metrics, installer, power, admin, ready_images)
           Разрешаю стереть SD-карту {escape(name)} и перезапустить Pi</label>
           <button {"disabled" if not available else ""}>Переустановить ОС</button>
         </form>
-      </details>""" if admin and ready_images else '<small>Для переустановки требуется зарегистрированная SD-карта.</small>' if admin else ""
+      </details>""" if admin and ready_images else '<small>Для переустановки нужны зарегистрированная SD-карта и настроенный PoE.</small>' if admin else ""
+    edit = f"""
+      <details><summary>Редактировать карточку</summary>
+        <form method="post" action="/devices/edit">
+          <input type="hidden" name="ip" value="{ip}">
+          <label>Имя<input name="name" required maxlength="60" value="{escape(name, quote=True)}"></label>
+          <label>Порт коммутатора (необязательно)<input name="port" type="number" min="1" max="24" value="{physical_port or ''}"></label>
+          <label>CID SD-карты (необязательно)<input name="cid" pattern="[a-fA-F0-9]{{32}}" maxlength="32" value="{cid or ''}"></label>
+          <button>Сохранить карточку</button>
+        </form>
+      </details>""" if admin else ""
     return f"""
       <article data-device="{ip}"><div class="card-head"><div class="device-icon" aria-hidden="true">Pi</div>
-      <div class="identity"><h3>{escape(name)}</h3><code>{ip} · порт {physical_port if physical_port is not None else "не указан"}</code></div>
+      <div class="identity"><h3>{escape(name)}</h3><code>{ip}{f" · порт {physical_port}" if physical_port is not None else ""}</code></div>
       <span class="badge {'up' if online else 'down' if last else ''}">{state}</span></div>
       <div class="health"><div class="line"><b>История SSH</b><span>{checked}</span></div>
       <div class="bars" aria-label="Последние проверки SSH">{bars or '<small>Пока нет данных</small>'}</div></div>
@@ -205,7 +217,7 @@ def render_card(device, samples, metrics, installer, power, admin, ready_images)
         <div class="fields"><label>Образ ОС<select name="image">{options(IMAGES, image)}</select></label>
         <label>Желаемая загрузка<select name="boot">{options(BOOT, boot)}</select></label></div>
         <button class="secondary">Сохранить</button>
-      </form>{install}</article>"""
+      </form>{edit}{install}</article>"""
 
 
 class Panel(BaseHTTPRequestHandler):
@@ -242,7 +254,7 @@ class Panel(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         with sqlite3.connect(self.server.database) as db:
-            devices = db.execute("SELECT ip, name, image, boot, physical_port FROM devices ORDER BY name, ip").fetchall()
+            devices = db.execute("SELECT ip, name, image, boot, physical_port, sd_cid FROM devices ORDER BY name, ip").fetchall()
             samples = {
                 ip: db.execute("SELECT checked, online FROM samples WHERE ip=? ORDER BY checked DESC LIMIT 24", (ip,)).fetchall()
                 for ip, *_ in devices
@@ -255,16 +267,16 @@ class Panel(BaseHTTPRequestHandler):
         down = sum(bool(history and not history[0][1]) for history in samples.values())
         installer = installation_status(self.server.database)
         rows = "".join(
-            render_card(device, samples[device[0]], metrics[device[0]], installer if device[0] == self.server.test_pi else None, render_power(self.server, device[0], device[4]), self.server.admin, self.ready_images(device[0]))
+            render_card(device, samples[device[0]], metrics[device[0]], installer if device[0] == self.server.test_pi else None, render_power(self.server, device[0], device[4]), self.server.admin, self.ready_images(device[0]) if device[5] and device[4] is not None else set())
             for device in devices
         )
         enroll_fields = """
-        <label>SSH-логин<input name="login" required autocomplete="username" placeholder="mortal"></label>
-        <label>Пароль SSH<input type="password" name="password" required autocomplete="current-password"></label>
-        <label class="wide">Отпечаток ключа Pi<input name="fingerprint" required placeholder="SHA256:…"></label>
+        <label>SSH-логин<input name="login" autocomplete="username" placeholder="mortal"></label>
+        <label>Пароль SSH<input type="password" name="password" autocomplete="current-password"></label>
+        <label class="wide">Отпечаток ключа Pi<input name="fingerprint" placeholder="SHA256:…"></label>
         """ if self.server.admin else ""
-        action = "/enroll" if self.server.admin else "/devices"
-        label = "Подключить метрики" if self.server.admin else "Добавить"
+        action = "/devices"
+        label = "Добавить"
         hint = "" if self.server.admin else "<p>Для подключения метрик откройте защищённую панель по HTTPS.</p>"
         html = f"""<!doctype html>
         <html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -299,8 +311,11 @@ class Panel(BaseHTTPRequestHandler):
         <aside><h2>Добавить Raspberry Pi</h2>{hint}<form method="post" action="{action}">
         <label>Имя<input name="name" required maxlength="60" placeholder="pi-lab-02"></label>
         <label>IPv4<input name="ip" required placeholder="192.168.10.250"></label>
-        <label>Порт коммутатора<input name="port" type="number" required min="1" max="24" step="1" placeholder="19"></label>
-        {enroll_fields}<button>{label}</button></form></aside>
+        <label>Порт коммутатора (необязательно)<input name="port" type="number" min="1" max="24" step="1" placeholder="19"></label>
+        {('<label>CID SD-карты (необязательно)<input name="cid" pattern="[a-fA-F0-9]{32}" maxlength="32"></label><small>На Pi: cat /sys/block/mmcblk0/device/cid</small>') if self.server.admin else ""}
+        <button>{label}</button>
+        {('<button formaction="/enroll" formnovalidate>Подключить метрики</button><details class="wide"><summary>Данные SSH для метрик</summary>' + enroll_fields + '</details>') if self.server.admin else ""}
+        </form></aside>
         <footer>Проверка SSH каждые 30 секунд. Состояние обновляется автоматически. Параметры загрузки и образа сохраняются как настройки.
         Переустановка доступна для зарегистрированной SD-карты.</footer></main>
         <script>
@@ -353,15 +368,35 @@ class Panel(BaseHTTPRequestHandler):
             ip = ipaddress.IPv4Address(data["ip"][0])
             if ip not in self.server.network or ip in (self.server.network.network_address, self.server.network.broadcast_address):
                 raise ValueError
-            if self.path in ("/devices", "/enroll"):
-                port = int(data["port"][0])
-                if not 1 <= port <= 24:
+            if self.path in ("/devices", "/enroll", "/devices/edit"):
+                port_text = data.get("port", [""])[0]
+                port = int(port_text) if port_text else None
+                cid = data.get("cid", [""])[0].strip().lower() or None
+                if (port is not None and not 1 <= port <= 24
+                        or cid is not None and (not self.server.admin or not re.fullmatch(r"[0-9a-f]{32}", cid))):
                     raise ValueError
                 with sqlite3.connect(self.server.database) as db:
                     owner = db.execute("SELECT ip FROM devices WHERE physical_port=?", (port,)).fetchone()
                     if owner and owner[0] != str(ip):
                         self.send_error(409, "Switch port already assigned")
                         return
+            if self.path == "/devices/edit":
+                if not self.server.admin:
+                    self.send_error(404)
+                    return
+                name = data["name"][0].strip()
+                if not 0 < len(name) <= 60:
+                    raise ValueError
+                with self.server.power_lock, sqlite3.connect(self.server.database) as db:
+                    if str(ip) == self.server.test_pi and install_busy(self.server.database):
+                        self.send_error(409, "An installation is already active")
+                        return
+                    if not db.execute("UPDATE devices SET name=?, physical_port=?, sd_cid=? WHERE ip=?",
+                                      (name, port, cid, str(ip))).rowcount:
+                        self.send_error(404)
+                        return
+                self.redirect()
+                return
             if self.path == "/power":
                 if not self.server.admin or str(ip) not in self.server.switch.ports:
                     self.send_error(404)
@@ -408,6 +443,11 @@ class Panel(BaseHTTPRequestHandler):
                             self.send_error(409, "An installation is already active")
                             return
                         with sqlite3.connect(self.server.database) as db:
+                            device = db.execute("SELECT physical_port, sd_cid FROM devices WHERE ip=?", (str(ip),)).fetchone()
+                            mapping = self.server.switch.ports.get(str(ip))
+                            if not device or not device[1] or not self.server.switch.allow_write or not mapping or device[0] != mapping[0]:
+                                self.send_error(409, "Register the SD card and verify the PoE port first")
+                                return
                             db.execute("INSERT OR REPLACE INTO reinstall VALUES (1, ?, ?, ?, ?, ?, 'queued')",
                                        (str(ip), image, hostname, login, hashed))
                     self.redirect()
@@ -432,9 +472,9 @@ class Panel(BaseHTTPRequestHandler):
                     raise ValueError
                 private = telemetry.enroll(str(ip), login, fingerprint, password)
                 with sqlite3.connect(self.server.database) as db:
-                    db.execute("INSERT INTO devices (ip, name, image, boot, physical_port) VALUES (?, ?, ?, ?, ?) "
-                               "ON CONFLICT(ip) DO UPDATE SET physical_port=excluded.physical_port",
-                               (str(ip), name, next(iter(IMAGES)), next(iter(BOOT)), port))
+                    db.execute("INSERT INTO devices (ip, name, image, boot, physical_port, sd_cid) VALUES (?, ?, ?, ?, ?, ?) "
+                               "ON CONFLICT(ip) DO NOTHING",
+                               (str(ip), name, next(iter(IMAGES)), next(iter(BOOT)), port, cid))
                     db.execute("INSERT OR REPLACE INTO collectors VALUES (?, ?, ?, ?)", (str(ip), login, fingerprint, private))
                     db.execute("DELETE FROM metrics WHERE ip = ?", (str(ip),))
                 self.redirect()
@@ -444,8 +484,8 @@ class Panel(BaseHTTPRequestHandler):
                     name = data["name"][0].strip()
                     if not 0 < len(name) <= 60:
                         raise ValueError
-                    db.execute("INSERT INTO devices (ip, name, image, boot, physical_port) VALUES (?, ?, ?, ?, ?)",
-                               (str(ip), name, next(iter(IMAGES)), next(iter(BOOT)), port))
+                    db.execute("INSERT INTO devices (ip, name, image, boot, physical_port, sd_cid) VALUES (?, ?, ?, ?, ?, ?)",
+                               (str(ip), name, next(iter(IMAGES)), next(iter(BOOT)), port, cid))
                 elif self.path == "/preferences":
                     image, boot = data["image"][0], data["boot"][0]
                     if image not in IMAGES or boot not in BOOT:
@@ -500,13 +540,16 @@ if __name__ == "__main__":
         db.execute("CREATE TABLE IF NOT EXISTS metrics (ip TEXT, checked INTEGER, ticks INTEGER, idle INTEGER, mem INTEGER, used INTEGER, rx INTEGER, tx INTEGER, disk INTEGER, PRIMARY KEY(ip, checked))")
         if "physical_port" not in {row[1] for row in db.execute("PRAGMA table_info(devices)")}:
             db.execute("ALTER TABLE devices ADD COLUMN physical_port INTEGER CHECK (physical_port BETWEEN 1 AND 24)")
+        if "sd_cid" not in {row[1] for row in db.execute("PRAGMA table_info(devices)")}:
+            db.execute("ALTER TABLE devices ADD COLUMN sd_cid TEXT")
+            seed = Switch(args.switch_config).directory / "install-device.json"
+            if seed.is_file():
+                device = json.loads(seed.read_text())
+                db.execute("UPDATE devices SET sd_cid=? WHERE ip=?", (device["cid"], device["ip"]))
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS devices_physical_port ON devices(physical_port)")
     Path(args.database).chmod(0o600)
 
     switch = Switch(args.switch_config)
-    with sqlite3.connect(args.database) as db:
-        for ip, (number, _) in switch.ports.items():
-            db.execute("UPDATE OR IGNORE devices SET physical_port=? WHERE ip=? AND physical_port IS NULL", (number, ip))
     power_lock = threading.Lock()
 
     def create_server(port, origin, admin, auth_digest=None):

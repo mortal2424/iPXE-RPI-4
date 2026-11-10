@@ -1,0 +1,19 @@
+services:
+  panel:
+    build: .
+    image: pi-fleet:local
+    ports:
+      - "${FLEET_IP}:80:8084"
+    command: ["panel.py", "--bind", "0.0.0.0", "--port", "8084", "--origin", "http://${FLEET_IP}", "--network", "${FLEET_NETWORK}", "--database", "/state/devices.db"]
+    cap_drop: [ALL]
+    volumes:
+      - ${FLEET_STATE}:/state
+    restart: unless-stopped
+  boot:
+    image: pi-fleet:local
+    network_mode: host
+    command: ["boot-http.py", "--bind", "${FLEET_IP}", "--client", "${FLEET_TEST_PI}", "--directory", "/boot-files"]
+    cap_drop: [ALL]
+    volumes:
+      - ${FLEET_BOOT_FILES}:/boot-files:ro
+    restart: unless-stopped

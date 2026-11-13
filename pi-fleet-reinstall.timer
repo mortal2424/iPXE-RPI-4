@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Pi Fleet for an installation request
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=10s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target

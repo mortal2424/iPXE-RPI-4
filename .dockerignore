@@ -1,3 +1,13 @@
 *
 !panel.py
 !boot-http.py
+
+!telemetry.py
+!poe.py
+!reinstall.py
+!eeprom.py
+!dashboard.css
+
+!vnc.py
+
+!favicon.png

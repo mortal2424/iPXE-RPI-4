@@ -1,0 +1,8 @@
+[Unit]
+Description=Pi Fleet SD image preparation and installation
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/pi-reinstall/reinstall.py
+TimeoutStartSec=55min
+UMask=0077

@@ -1,0 +1,7 @@
+# Copy to /srv/pi-reinstall/acme/selectel.ini (root:root 0600).
+# Quote values containing #, commas or leading/trailing spaces, e.g. password = "...".
+# Service-user credentials for the Selectel DNS API v2.
+dns_selectel_api_v2_account_id =
+dns_selectel_api_v2_project_name =
+dns_selectel_api_v2_username =
+dns_selectel_api_v2_password =

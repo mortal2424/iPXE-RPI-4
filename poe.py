@@ -18,12 +18,14 @@ class Switch:
         self.directory = Path(directory)
         self.target = None
         self.allow_write = False
+        self.allow_registration = False
         self.ports = {}
         path = self.directory / "switch.json"
         if not path.is_file() or not (self.directory / "snmp.conf").is_file():
             return
         data = json.loads(path.read_text())
         self.allow_write = data.get("allow_write") is True
+        self.allow_registration = self.allow_write and data.get("panel_port_registration") is True
         self.target = f"udp:{ipaddress.IPv4Address(data['address'])}:161"
         indexes = set()
         for ip, port in data["ports"].items():
@@ -35,6 +37,19 @@ class Switch:
                 raise ValueError("Duplicate PoE port mapping")
             indexes.add((group, index))
             self.ports[ip] = (number, f".{group}.{index}")
+
+    def load_registrations(self, db):
+        if not self.allow_registration:
+            return
+        rows = db.execute(
+            "SELECT r.ip,r.port FROM poe_registrations r JOIN devices d "
+            "ON r.ip=d.ip AND r.port=d.physical_port WHERE r.switch_target=?", (self.target,),
+        ).fetchall()
+        for ip, port in rows:
+            index = f".1.{port}"
+            if ip not in self.ports and all(number != port and existing != index
+                                            for number, existing in self.ports.values()):
+                self.ports[ip] = (port, index)
 
     def run(self, command, *args):
         env = {**os.environ, "SNMPCONFPATH": str(self.directory), "MIBS": ""}
@@ -49,6 +64,10 @@ class Switch:
 
     def status(self, ip):
         number, index = self.ports[ip]
+        enabled, delivering = self.port_state(index)
+        return number, enabled == 1, delivering
+
+    def port_state(self, index):
         response = self.run("snmpget", PORT_ADMIN + index, PORT_DETECTION + index)
         try:
             enabled, detection = (int(value) for value in response)
@@ -56,7 +75,17 @@ class Switch:
             raise PoeError("Unexpected PoE status") from error
         if enabled not in (1, 2):
             raise PoeError("Unknown PoE admin value")
-        return number, enabled == 1, detection == 3
+        return enabled, detection == 3
+
+    def verify_registration(self, number):
+        if not self.allow_registration:
+            raise PoeError("Port registration is disabled")
+        index = f".1.{number}"
+        enabled, _ = self.port_state(index)
+        self.run("snmpset", PORT_ADMIN + index, "i", str(enabled))
+        if self.port_state(index)[0] != enabled:
+            raise PoeError("Switch did not preserve the current PoE setting")
+        return number, index
 
     def set_power(self, ip, enabled):
         if not self.allow_write:

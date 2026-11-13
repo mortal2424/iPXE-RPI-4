@@ -1,4 +1,4 @@
-"""Serve Raspberry Pi EEPROM boot files only to the enrolled test Pi."""
+"""Serve Raspberry Pi EEPROM boot files only to the Pi selected for installation."""
 import argparse
 import re
 from pathlib import Path
@@ -12,8 +12,16 @@ class BootHandler(SimpleHTTPRequestHandler):
         self.jobs = jobs
         super().__init__(*args, **kwargs)
 
+    def is_target(self):
+        target = Path(self.directory) / "boot/target.ip"
+        try:
+            expected = target.read_text().strip()
+        except FileNotFoundError:
+            expected = self.client_ip
+        return self.client_address[0] == expected
+
     def send_head(self):
-        if self.client_address[0] != self.client_ip or self.path not in {
+        if not self.is_target() or self.path not in {
             "/boot/boot.img", "/boot/boot.sig", "/images/raspios-lite-arm64.img.xz",
             "/images/reinstall.img.xz",
         }:
@@ -23,7 +31,7 @@ class BootHandler(SimpleHTTPRequestHandler):
 
 
     def do_POST(self):
-        if self.client_address[0] != self.client_ip or self.path not in {"/claim", "/result"} or self.jobs is None:
+        if not self.is_target() or self.path not in {"/claim", "/result"} or self.jobs is None:
             self.send_error(404)
             return
         if self.path == "/result":

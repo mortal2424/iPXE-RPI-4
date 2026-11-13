@@ -32,6 +32,9 @@ sectors=$("$bb" cat /sys/block/mmcblk0/size)
 
 "$bb" ip link set eth0 up
 "$bb" ip addr add "$PI_ADDRESS" dev eth0
+if [ -n "${PI_GATEWAY:-}" ]; then
+    "$bb" ip route add "$BOOT_SERVER/32" via "$PI_GATEWAY" dev eth0
+fi
 for attempt in $("$bb" seq 1 20); do
     [ "$("$bb" cat /sys/class/net/eth0/carrier)" = 1 ] && break
     "$bb" sleep 1

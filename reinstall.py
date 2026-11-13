@@ -1,4 +1,5 @@
 """Validate and process one device-bound installation request on the provisioner."""
+import base64
 import hashlib
 import ipaddress
 import json
@@ -30,11 +31,133 @@ STATES = {
 
 
 def schema(db):
+    db.execute("CREATE TABLE IF NOT EXISTS provisioning (ip TEXT PRIMARY KEY, mac TEXT NOT NULL, max_payload INTEGER NOT NULL)")
     db.execute("""CREATE TABLE IF NOT EXISTS reinstall (
         id INTEGER PRIMARY KEY CHECK(id=1), ip TEXT NOT NULL, image TEXT NOT NULL,
         hostname TEXT NOT NULL, login TEXT NOT NULL, password_hash TEXT NOT NULL,
         status TEXT NOT NULL
     )""")
+
+    if "network_json" not in {row[1] for row in db.execute("PRAGMA table_info(reinstall)")}:
+        db.execute("ALTER TABLE reinstall ADD COLUMN network_json TEXT NOT NULL DEFAULT '{}'")
+
+    db.execute("""CREATE TABLE IF NOT EXISTS reinstall_ssh (
+        ip TEXT PRIMARY KEY, login TEXT NOT NULL, secret BLOB NOT NULL,
+        mac TEXT NOT NULL, expires INTEGER, fingerprint TEXT
+    )""")
+
+    db.execute("""CREATE TABLE IF NOT EXISTS reinstall_networks (
+        network TEXT PRIMARY KEY, gateway TEXT NOT NULL
+    )""")
+
+
+def parse_reinstall_networks(value, primary):
+    """Extra installation networks and their on-link IPv4 gateways."""
+    profiles = {}
+    for line in value.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            raise ValueError("На каждой строке укажите подсеть CIDR и шлюз через пробел.")
+        network = ipaddress.IPv4Network(parts[0])
+        gateway = ipaddress.IPv4Address(parts[1])
+        if (not 1 <= network.prefixlen <= 30 or not gateway in network
+                or gateway in (network.network_address, network.broadcast_address)
+                or gateway.is_unspecified or gateway.is_loopback or gateway.is_multicast
+                or network.overlaps(primary)
+                or any(network.overlaps(other) for other in profiles)):
+            raise ValueError("Подсети не должны пересекаться. Шлюз должен быть адресом устройства внутри своей подсети.")
+        profiles[network] = gateway
+    return profiles
+
+
+def reinstall_profile(ip, primary, profiles):
+    address = ipaddress.IPv4Address(ip)
+    for network, gateway in [(primary, None), *profiles.items()]:
+        if address in network and address not in (network.network_address, network.broadcast_address, gateway):
+            return network, gateway
+    return None
+
+
+def load_reinstall_networks(db, primary):
+    rows = db.execute("SELECT network,gateway FROM reinstall_networks ORDER BY network").fetchall()
+    return parse_reinstall_networks("\n".join(f"{network} {gateway}" for network, gateway in rows), primary)
+
+
+def local_host_fingerprint(ip, mac):
+    """Read an Ed25519 key from a Pi on the directly connected installation network."""
+    route = json.loads(run("ip", "-j", "route", "get", ip, capture_output=True, text=True).stdout)[0]
+    if "gateway" in route or route.get("type") == "local":
+        raise ValueError("Pi is not on a directly connected link")
+    scan = subprocess.run(["ssh-keyscan", "-T", "3", "-t", "ed25519", ip],
+                          capture_output=True, text=True, timeout=5)
+    neighbors = json.loads(run("ip", "-j", "neigh", "show", "to", ip, "dev", route["dev"],
+                               capture_output=True, text=True).stdout)
+    if not any(n.get("lladdr", "").lower() == mac.lower() for n in neighbors):
+        raise ValueError("Pi Ethernet MAC did not match")
+    for line in scan.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[:2] == [ip, "ssh-ed25519"]:
+            digest = hashlib.sha256(base64.b64decode(fields[2], validate=True)).digest()
+            return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+    raise ValueError("Pi SSH host key is not available")
+
+
+def discover_reinstalled_hosts(db):
+    now = int(time.time())
+    with db:
+        db.execute("DELETE FROM reinstall_ssh WHERE expires <= ?", (now,))
+    pending = db.execute("""SELECT ip, mac, expires FROM reinstall_ssh
+                            WHERE expires > ? AND fingerprint IS NULL""", (now,)).fetchall()
+    for ip, mac, expires in pending:
+        try:
+            fingerprint = local_host_fingerprint(ip, mac)
+        except (ValueError, OSError, KeyError, IndexError, subprocess.SubprocessError):
+            continue
+        with db:
+            db.execute("UPDATE reinstall_ssh SET fingerprint=? WHERE ip=? AND expires=?",
+                       (fingerprint, ip, expires))
+
+
+def installation_network(ip, mode, address="", prefix=24, gateway="", dns=""):
+    if mode == "dhcp":
+        return {"mode": "dhcp"}
+    if mode != "static":
+        raise ValueError("Выберите статический IP или DHCP.")
+    address = ipaddress.IPv4Address(address)
+    interface = ipaddress.IPv4Interface(f"{address}/{int(prefix)}")
+    route = ipaddress.IPv4Address(gateway)
+    servers = [str(ipaddress.IPv4Address(value)) for value in dns.replace(",", " ").split()]
+    if (str(address) != str(ip) or not 1 <= interface.network.prefixlen <= 30
+            or address in (interface.network.network_address, interface.network.broadcast_address)
+            or address.is_loopback or address.is_multicast or address.is_unspecified
+            or route not in interface.network or route == address
+            or route in (interface.network.network_address, interface.network.broadcast_address)
+            or not 1 <= len(servers) <= 3
+            or any(ipaddress.IPv4Address(value).is_loopback or ipaddress.IPv4Address(value).is_multicast
+                   or ipaddress.IPv4Address(value).is_unspecified for value in servers)):
+        raise ValueError("Проверьте IP карточки, префикс, шлюз в той же сети и от 1 до 3 DNS-серверов.")
+    return {"mode": "static", "address": str(address), "prefix": interface.network.prefixlen,
+            "gateway": str(route), "dns": servers}
+
+
+def network_config(image, mac, settings, ip):
+    if image not in IMAGES or not re.fullmatch(r"(?:[a-f0-9]{2}:){5}[a-f0-9]{2}", mac):
+        raise ValueError("Invalid network device")
+    settings = installation_network(ip, settings.get("mode"), settings.get("address", ""),
+                                    settings.get("prefix", 24), settings.get("gateway", ""),
+                                    " ".join(settings.get("dns", [])))
+    nic = {"match": {"macaddress": mac}, "dhcp4": settings["mode"] == "dhcp", "dhcp6": False}
+    if settings["mode"] == "static":
+        nic.update({"addresses": [f"{settings['address']}/{settings['prefix']}"],
+                    "routes": [{"to": "0.0.0.0/0", "via": settings["gateway"]}],
+                    "nameservers": {"addresses": settings["dns"]}})
+    elif image == "ubuntu-server-24.04":
+        nic["dhcp-identifier"] = "mac"
+    config = {"version": 2, "renderer": "NetworkManager" if image == "raspios-lite-arm64" else "networkd",
+              "ethernets": {"fleet": nic}}
+    return json.dumps(config, indent=2) + "\n"
 
 
 def valid_account(hostname, login):
@@ -71,7 +194,7 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def personalize(source, raw, user_data, mountpoint):
+def personalize(source, raw, user_data, mountpoint, network_data=None):
     with raw.open("wb") as output:
         run("xz", "-dc", source, stdout=output)
     loop = run("losetup", "--find", "--show", "--partscan", raw,
@@ -84,6 +207,8 @@ def personalize(source, raw, user_data, mountpoint):
             if not seed.is_file():
                 raise ValueError("No cloud-init seed in image")
             seed.write_text(user_data)
+            if network_data is not None:
+                (mountpoint / "network-config").write_text(network_data)
         finally:
             run("umount", mountpoint)
     finally:
@@ -91,22 +216,35 @@ def personalize(source, raw, user_data, mountpoint):
 
 
 def process(db, base, state, settings, request):
-    ip, image, hostname, login, password_hash = request
-    if ip != str(ipaddress.IPv4Address(settings["ip"])):
+    ip, image, hostname, login, password_hash, *extra = request
+    network = json.loads(extra[0]) if extra else {}
+    registered = db.execute("SELECT mac,max_payload FROM provisioning WHERE ip=?", (ip,)).fetchone()
+    if registered:
+        mac, max_payload = registered
+    elif ip == str(ipaddress.IPv4Address(settings["ip"])):
+        mac, max_payload = settings["mac"], int(settings["max_payload_bytes"])
+    else:
         raise ValueError("Pi is not registered for installation")
     device = db.execute("SELECT physical_port, sd_cid FROM devices WHERE ip=?", (ip,)).fetchone()
-    if not device or device[0] != settings["port"] or not device[1]:
+    if not device or device[0] is None or not device[1]:
         raise ValueError("SD card or verified port not registered")
-    cid, mac = device[1], settings["mac"]
+    port, cid = device
     if not re.fullmatch(r"[a-f0-9]{32}", cid) or not re.fullmatch(r"(?:[a-f0-9]{2}:){5}[a-f0-9]{2}", mac):
         raise ValueError("Invalid device identity")
     server = str(ipaddress.IPv4Address(settings["server"]))
-    address = ipaddress.IPv4Interface(f"{ip}/{settings['prefix']}")
+    primary = ipaddress.IPv4Interface(f"{server}/{settings['prefix']}").network
+    profile = reinstall_profile(ip, primary, load_reinstall_networks(db, primary))
+    if not profile or ip == server:
+        raise ValueError("Pi is outside the allowed installation networks")
+    subnet, gateway = profile
+    address = ipaddress.IPv4Interface(f"{ip}/{subnet.prefixlen}")
     switch = Switch(state / "switch")
-    if not switch.allow_write or switch.ports.get(ip, (None,))[0] != settings["port"]:
+    switch.load_registrations(db)
+    if not switch.allow_write or switch.ports.get(ip, (None,))[0] != port:
         raise ValueError("No verified PoE control for this device")
     source = base / "images" / (image + ".img.xz")
     config = cloud_config(image, hostname, login, password_hash)
+    network_data = network_config(image, mac, network, ip) if network else None
     jobs = state / "state/jobs"
     publish = state / "boot"
     payload = state / "images/reinstall.img.xz"
@@ -119,6 +257,11 @@ def process(db, base, state, settings, request):
     def status(value):
         with db:
             db.execute("UPDATE reinstall SET status=?, password_hash='' WHERE id=1", (value,))
+            if value == "complete":
+                db.execute("UPDATE reinstall_ssh SET expires=? WHERE ip=?",
+                           (int(time.time()) + 3600, ip))
+            elif value in ("failed", "uncertain"):
+                db.execute("DELETE FROM reinstall_ssh WHERE ip=?", (ip,))
 
     if (publish / "boot.sig").exists():
         raise ValueError("Another boot image is already published")
@@ -127,15 +270,15 @@ def process(db, base, state, settings, request):
             work = Path(directory)
             raw, fat, packed = work / "os.img", work / "fat", work / "os.img.xz"
             fat.mkdir()
-            personalize(source, raw, config, fat)
+            personalize(source, raw, config, fat, network_data)
             with packed.open("wb") as output:
                 run("xz", "-T2", "-0", "-c", raw, stdout=output)
-            max_payload = int(settings["max_payload_bytes"])
             if packed.stat().st_size > max_payload:
                 raise ValueError("Selected image exceeds the registered Pi RAM budget")
             installer = work / "install.conf"
             installer.write_text(
                 f"SD_CID={cid}\nPI_MAC={mac}\nPI_ADDRESS={address}\n"
+                f"BOOT_SERVER={server}\nPI_GATEWAY={gateway or ''}\n"
                 f"IMAGE_URL=http://{server}:8083/images/reinstall.img.xz\n"
                 f"CLAIM_URL=http://{server}:8083/claim\n"
                 f"RESULT_URL=http://{server}:8083/result\n"
@@ -149,6 +292,9 @@ def process(db, base, state, settings, request):
             run("install", "-m", "0644", packed, payload)
             run("install", "-m", "0644", work / "boot.img", publish / "boot.img")
             run("install", "-m", "0600", "-o", "10001", "-g", "10001", "/dev/null", pending)
+            target = work / "target.ip"
+            target.write_text(ip + "\n")
+            run("install", "-m", "0644", target, publish / "target.ip")
             run("install", "-m", "0644", work / "boot.sig", publish / "boot.sig")
         status("waiting")
         switch.restart(ip)
@@ -171,7 +317,7 @@ def process(db, base, state, settings, request):
             time.sleep(2)
         status("uncertain")
     finally:
-        for file in (pending, publish / "boot.sig", publish / "boot.img", payload):
+        for file in (pending, publish / "boot.sig", publish / "boot.img", payload, publish / "target.ip"):
             file.unlink(missing_ok=True)
         if not claim_consumed and claimed.exists():
             status("uncertain")
@@ -182,9 +328,10 @@ def main():
     settings = json.loads((base / "install-device.json").read_text())
     with sqlite3.connect(state / "state/devices.db") as db:
         schema(db)
+        discover_reinstalled_hosts(db)
         db.execute("BEGIN IMMEDIATE")
         request = db.execute(
-            "SELECT ip,image,hostname,login,password_hash FROM reinstall WHERE status='queued'"
+            "SELECT ip,image,hostname,login,password_hash,network_json FROM reinstall WHERE status='queued'"
         ).fetchone()
         if not request:
             return
@@ -194,6 +341,7 @@ def main():
     except Exception as error:
         print(f"Installation error: {type(error).__name__}", flush=True)
         with db:
+            db.execute("DELETE FROM reinstall_ssh WHERE ip=?", (request[0],))
             db.execute("UPDATE reinstall SET status=CASE WHEN status IN ('waiting','writing','uncertain') THEN 'uncertain' ELSE 'failed' END WHERE id=1")
         raise SystemExit(1) from None
     finally:

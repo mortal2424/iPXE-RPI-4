@@ -11,3 +11,8 @@ snmp.conf
 auth.sha256
 admin-password
 install-device.json
+
+# DNS API credentials and ACME account / certificate state
+selectel.ini
+acme/
+letsencrypt/

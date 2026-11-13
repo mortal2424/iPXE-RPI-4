@@ -5,7 +5,7 @@ services:
     ports:
       - "${FLEET_IP}:80:8084"
       - "${FLEET_IP}:443:8443"
-    command: ["panel.py", "--bind", "0.0.0.0", "--port", "8084", "--origin", "http://${FLEET_IP}", "--network", "${FLEET_NETWORK}", "--database", "/state/devices.db", "--test-pi", "${FLEET_TEST_PI}", "--https-origin", "https://${FLEET_IP}", "--tls-dir", "/tls", "--switch-config", "/switch"]
+    command: ["panel.py", "--bind", "0.0.0.0", "--port", "8084", "--origin", "http://${FLEET_IP}", "--network", "${FLEET_NETWORK}", "--management-networks", "${FLEET_MANAGEMENT_NETWORKS:-}", "--database", "/state/devices.db", "--test-pi", "${FLEET_TEST_PI}", "--https-origin", "https://${FLEET_DOMAIN:-${FLEET_IP}}", "--allowed-origin", "https://${FLEET_IP}", "--boot-host", "${FLEET_IP}", "--tls-dir", "/tls", "--switch-config", "/switch"]
     cap_drop: [ALL]
     volumes:
       - ${FLEET_STATE}:/state

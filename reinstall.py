@@ -16,8 +16,30 @@ from poe import PoeError, Switch
 
 IMAGES = {
     "raspios-lite-arm64": "Raspberry Pi OS Lite · 64-bit",
+    "raspios-desktop-arm64": "Raspberry Pi OS Desktop · 64-bit",
     "ubuntu-server-24.04": "Ubuntu Server 24.04 LTS · 64-bit",
 }
+RAW_IMAGES = {
+    "dietpi-arm64": {"pi4b", "cm4"},
+    "debian-arm64": {"pi4b"},
+    "openwrt-arm64": {"pi4b", "cm4"},
+    "home-assistant-os": {"pi4b"},
+    "libreelec-arm64": {"pi4b", "cm4"},
+}
+IMAGES.update({
+    "dietpi-arm64": "DietPi · 64-bit",
+    "debian-arm64": "Debian · 64-bit",
+    "openwrt-arm64": "OpenWrt · 64-bit",
+    "home-assistant-os": "Home Assistant OS · 64-bit",
+    "libreelec-arm64": "LibreELEC · 64-bit",
+})
+PI_OS_IMAGES = {"raspios-lite-arm64", "raspios-desktop-arm64"}
+
+
+def supports_board(image, board):
+    return image in IMAGES and board in RAW_IMAGES.get(image, {"pi4b", "cm4"})
+
+
 ACTIVE = ("queued", "preparing", "ssh_restart", "restart_fallback", "manual_restart", "waiting", "writing", "uncertain")
 STATES = {
     "queued": "В очереди",
@@ -152,7 +174,7 @@ def installation_network(ip, mode, address="", prefix=24, gateway="", dns=""):
 
 
 def network_config(image, mac, settings, ip):
-    if image not in IMAGES or not re.fullmatch(r"(?:[a-f0-9]{2}:){5}[a-f0-9]{2}", mac):
+    if image not in IMAGES or image in RAW_IMAGES or not re.fullmatch(r"(?:[a-f0-9]{2}:){5}[a-f0-9]{2}", mac):
         raise ValueError("Invalid network device")
     settings = installation_network(ip, settings.get("mode"), settings.get("address", ""),
                                     settings.get("prefix", 24), settings.get("gateway", ""),
@@ -164,7 +186,7 @@ def network_config(image, mac, settings, ip):
                     "nameservers": {"addresses": settings["dns"]}})
     elif image == "ubuntu-server-24.04":
         nic["dhcp-identifier"] = "mac"
-    config = {"version": 2, "renderer": "NetworkManager" if image == "raspios-lite-arm64" else "networkd",
+    config = {"version": 2, "renderer": "NetworkManager" if image in PI_OS_IMAGES else "networkd",
               "ethernets": {"fleet": nic}}
     return json.dumps(config, indent=2) + "\n"
 
@@ -178,7 +200,7 @@ def valid_account(hostname, login):
 
 
 def cloud_config(image, hostname, login, password_hash):
-    if image not in IMAGES or not valid_account(hostname, login) or not re.fullmatch(
+    if image not in IMAGES or image in RAW_IMAGES or not valid_account(hostname, login) or not re.fullmatch(
         r"\$6\$[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}", password_hash
     ):
         raise ValueError("Invalid installation parameters")
@@ -187,7 +209,7 @@ def cloud_config(image, hostname, login, password_hash):
         "users": [{"name": login, "shell": "/bin/bash", "groups": ["sudo"],
                    "passwd": password_hash, "lock_passwd": False}],
     }
-    if image == "raspios-lite-arm64":
+    if image in PI_OS_IMAGES:
         config["enable_ssh"] = True
     else:
         config["runcmd"] = [["systemctl", "enable", "--now", "ssh.service"]]
@@ -265,9 +287,12 @@ def process(db, base, state, settings, request):
         raise ValueError("Unsupported installer board")
     if board == "cm4" and not (base / "build/bcm2711-rpi-cm4.dtb").is_file():
         raise ValueError("CM4 device tree is missing from the installer")
+    if not supports_board(image, board):
+        raise ValueError("Image is unavailable for this board")
     source = base / "images" / (image + ".img.xz")
-    config = cloud_config(image, hostname, login, password_hash)
-    network_data = network_config(image, mac, network, ip) if network else None
+    raw_image = image in RAW_IMAGES
+    config = None if raw_image else cloud_config(image, hostname, login, password_hash)
+    network_data = network_config(image, mac, network, ip) if not raw_image and network else None
     jobs = state / "state/jobs"
     publish = state / "boot"
     payload = state / "images/reinstall.img.xz"
@@ -294,9 +319,16 @@ def process(db, base, state, settings, request):
             work = Path(directory)
             raw, fat, packed = work / "os.img", work / "fat", work / "os.img.xz"
             fat.mkdir()
-            personalize(source, raw, config, fat, network_data)
-            with packed.open("wb") as output:
-                run("xz", "-T2", "-0", "-c", raw, stdout=output)
+            if raw_image:
+                packed = source
+                if packed.stat().st_size > max_payload:
+                    raise ValueError("Selected image exceeds the registered Pi RAM budget")
+                with raw.open("wb") as output:
+                    run("xz", "-dc", packed, stdout=output)
+            else:
+                personalize(source, raw, config, fat, network_data)
+                with packed.open("wb") as output:
+                    run("xz", "-T2", "-0", "-c", raw, stdout=output)
             if packed.stat().st_size > max_payload:
                 raise ValueError("Selected image exceeds the registered Pi RAM budget")
             installer = work / "install.conf"

@@ -100,3 +100,87 @@ def install(ip, login, fingerprint, password, vnc_password):
         code = stdout.channel.recv_exit_status()
     if code:
         raise paramiko.SSHException(ERRORS.get(code, "Установка VNC не завершилась. Проверьте пароль sudo и журнал на Pi."))
+
+
+def relay_console(handler, ip, login, fingerprint, password):
+    """Relay binary WebSocket messages to x11vnc through the pinned Pi SSH connection."""
+    import select
+    import socket
+    from websockify.websocket import WebSocket, WebSocketWantReadError
+
+    class BinaryWebSocket(WebSocket):
+        def select_subprotocol(self, protocols):
+            return "binary" if "binary" in protocols else ""
+
+    with connect(ip, login, fingerprint, password=password) as client:
+        with client.get_transport().open_session(timeout=5) as channel:
+            channel.settimeout(5)
+            channel.exec_command(
+                f"exec openssl s_client -quiet -connect 127.0.0.1:{PORT} 2>/dev/null"
+            )
+            banner = bytearray()
+            while len(banner) < 12:
+                part = channel.recv(12 - len(banner))
+                if not part:
+                    raise OSError("VNC service is unavailable")
+                banner.extend(part)
+            if not re.fullmatch(rb"RFB 003\.00[378]\n", banner):
+                raise OSError("Unexpected VNC server response")
+
+            websocket = BinaryWebSocket()
+            handler.connection.settimeout(10)
+            handler.close_connection = True
+            try:
+                websocket.accept(handler.connection, handler.headers)
+                websocket.sendmsg(bytes(banner))
+                while True:
+                    buffered = websocket.pending() or handler.connection.pending()
+                    readable, _, _ = select.select(
+                        [handler.connection, channel], [], [], 0 if buffered else 300,
+                    )
+                    if not readable and not buffered:
+                        break
+                    if channel in readable:
+                        data = channel.recv(65536)
+                        if not data:
+                            break
+                        websocket.sendmsg(data)
+                    if handler.connection in readable or buffered:
+                        try:
+                            data = websocket.recvmsg()
+                        except WebSocketWantReadError:
+                            continue
+                        if data is None:
+                            break
+                        channel.sendall(data)
+            except (OSError, ValueError, paramiko.SSHException):
+                pass
+            finally:
+                try:
+                    websocket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+def console_page(name, ip):
+    from html import escape
+
+    return f"""<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Консоль · {escape(name)}</title>
+<style>
+body {{margin:0;background:#101820;color:#f4f7fa;font:16px system-ui;display:flex;flex-direction:column;height:100dvh}}
+header {{display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:12px 16px;background:#223344}}
+a {{color:#bfe7ff}} button,input {{font:inherit;padding:6px 10px;border-radius:5px}}
+form {{margin:0}} #screen {{min-height:0;flex:1;overflow:hidden}}
+</style>
+<header><a href="/">Pi Fleet</a><strong>{escape(name)} · {ip}</strong>
+<span id="status" role="status">Подключение…</span>
+<button id="retry" hidden>Подключиться снова</button>
+<form id="credentials" hidden><label>Пароль VNC <input id="password" type="password" required autocomplete="off"></label>
+<button>Подключиться</button></form></header>
+<div id="screen"></div>
+<script type="module" src="/novnc/pi-fleet-console.js"></script>
+</html>"""

@@ -3,6 +3,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import mimetypes
 import ssl
 from urllib.parse import urlsplit
 import ipaddress
@@ -27,7 +28,7 @@ import eeprom
 import vnc
 from poe import PoeError, Switch
 
-from reinstall import ACTIVE, IMAGES, STATES, cloud_config, schema, valid_account, installation_network
+from reinstall import ACTIVE, IMAGES, RAW_IMAGES, supports_board, STATES, cloud_config, schema, valid_account, installation_network
 from reinstall import load_reinstall_networks, parse_reinstall_networks, reinstall_profile
 DASHBOARD_CSS = Path(__file__).with_name("dashboard.css").read_text()
 BOOT = {"http-sd": "HTTP → SD", "sd-http": "SD → HTTP", "sd": "Только SD"}
@@ -372,11 +373,18 @@ def render_card(device, samples, metrics, history, installer, power, admin, read
     )
     status = f'<div class="job install-status"{" hidden" if not installer else ""}><b>Переустановка</b><span>{installer or ""}</span></div>'
     available = {key: label for key, label in IMAGES.items() if key in ready_images}
+    image_options = "".join(
+        f'<option value="{key}" {"selected" if key == image else ""} '
+        f'data-raw="{str(key in RAW_IMAGES).lower()}">{label}</option>'
+        for key, label in available.items()
+    )
     install = f"""
       <details><summary>Настройки новой ОС</summary>
         <form method="post" action="/reinstall">
-          <label>Новая ОС<select name="image" required>{options(available, image)}</select></label>
+          <label>Новая ОС<select name="image" required>{image_options}</select></label>
           <input type="hidden" name="ip" value="{ip}">
+          <p data-raw-note hidden>Готовый образ будет записан как есть. Сеть и доступ настройте средствами выбранной ОС после загрузки. Для OpenWrt заранее подготовьте образ с адресом управления или подключите локальную консоль.</p>
+          <fieldset data-os-settings>
           <label>Имя хоста<input name="hostname" required maxlength="63"></label>
           <label>Логин<input name="login" required maxlength="32"></label>
           <label>Пароль<input type="password" name="password" required minlength="8" maxlength="128" autocomplete="new-password"></label>
@@ -386,6 +394,7 @@ def render_card(device, samples, metrics, history, installer, power, admin, read
             <label>Префикс сети<input name="prefix" type="number" min="1" max="30" required value="{network_defaults.get('prefix',24)}"></label>
             <label>Шлюз<input name="gateway" required value="{escape(network_defaults.get('gateway',''),quote=True)}" placeholder="192.0.2.1"></label>
             <label>DNS (через пробел)<input name="dns" required value="{escape(network_defaults.get('dns',''),quote=True)}" placeholder="192.0.2.1"></label>
+          </fieldset>
           </fieldset>
           <label class="confirm"><input type="checkbox" name="confirm" value="yes" required>
           Разрешаю стереть SD-карту {escape(name)} и перезапустить Pi</label>
@@ -399,7 +408,7 @@ def render_card(device, samples, metrics, history, installer, power, admin, read
           <label>Имя<input name="name" required maxlength="60" value="{escape(name, quote=True)}"></label>
           <label>Порт коммутатора (необязательно)<input name="port" type="number" min="1" max="24" value="{physical_port or ''}"></label>
           <label>CID SD-карты (необязательно)<input name="cid" pattern="[a-fA-F0-9]{{32}}" maxlength="32" value="{cid or ''}"></label>
-          <label>Адрес VNC / веб-консоли (необязательно)<input name="vnc_url" maxlength="512" value="{escape(vnc_url, quote=True)}" placeholder="vnc://{ip}:5900 или https://…"></label>
+          <label>Адрес внешней веб-консоли (необязательно)<input name="vnc_url" maxlength="512" value="{escape(vnc_url, quote=True)}" placeholder="https://…"></label>
           <button>Сохранить карточку</button>
         </form>
       </details>""" if admin else ""
@@ -453,14 +462,14 @@ def render_card(device, samples, metrics, history, installer, power, admin, read
       {status}
       {power}
       <div class="card-actions">{install_action}
-        <a class="button secondary" href="{escape(vnc_url or 'vnc://' + ip + ':5900', quote=True)}" target="_blank" rel="noopener noreferrer">Консоль VNC</a>
+        <a class="button secondary" href="{escape(vnc_url if urlsplit(vnc_url).scheme in ("http", "https") else f"/console/{ip}", quote=True)}" target="_blank" rel="noopener noreferrer">Консоль VNC</a>
         <button class="secondary" data-dialog="{dialog_id}">Настройки</button>
       </div>
       <dialog id="{dialog_id}" class="device-dialog">
         <div class="dialog-head"><div><h2>Настройки</h2><small>{escape(name)} · {ip}</small></div><button class="secondary" data-close-dialog aria-label="Закрыть">×</button></div>
         <details><summary>История метрик · 24 часа</summary>{render_charts(history)}</details>
         {edit}{ssh_access}{firmware}{setup}{vnc_setup}{install if not ready_images else ''}
-        <p class="console-hint">VNC Pi Fleet — настоящая локальная tty1, порт 5909. Нужен клиент с TLS/VeNCrypt. Для доступа до загрузки Linux используйте BliKVM.</p>
+        <p class="console-hint">VNC Pi Fleet — настоящая локальная tty1, порт 5909. Открывается в браузере через защищённое SSH-подключение панели. Для доступа до загрузки Linux используйте BliKVM.</p>
       </dialog>{install_dialog}</article>"""
 
 
@@ -502,6 +511,78 @@ class Panel(BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
+    def console(self):
+        if not self.server.admin or not self.server.auth_digest:
+            self.send_error(404)
+            return
+        if self.path.startswith("/novnc/"):
+            root = Path("/usr/share/novnc").resolve()
+            asset = (root / self.path.removeprefix("/novnc/")).resolve()
+            if root not in asset.parents or not asset.is_file() or asset.suffix not in {".js", ".css", ".svg", ".png", ".woff", ".woff2", ".json"}:
+                self.send_error(404)
+                return
+            body = asset.read_bytes()
+            content_type = mimetypes.guess_type(asset)[0] or "application/octet-stream"
+        else:
+            match = re.fullmatch(r"/console/([0-9.]+)(/socket)?", self.path)
+            if not match:
+                self.send_error(404)
+                return
+            ip, upgrade = match.groups()
+            with sqlite3.connect(self.server.database) as db:
+                row = db.execute(
+                    "SELECT d.name,c.login,c.fingerprint,e.secret FROM devices d "
+                    "LEFT JOIN collectors c USING(ip) LEFT JOIN eeprom_credentials e USING(ip) "
+                    "WHERE d.ip=?", (ip,),
+                ).fetchone()
+            if not row:
+                self.send_error(404)
+                return
+            name, login, fingerprint, secret = row
+            if not all((login, fingerprint, secret, self.server.credential_cipher)):
+                self.send_error(409, "SSH access required", "Сохраните SSH-доступ в настройках карточки Pi.")
+                return
+            if upgrade:
+                origin = self.headers.get("Origin")
+                protocols = self.headers.get("Sec-WebSocket-Protocol", "").split(",")
+                if (origin not in self.server.allowed_origins or self.headers.get("Host") != urlsplit(origin).netloc
+                        or self.headers.get("Upgrade", "").lower() != "websocket"
+                        or self.headers.get("Sec-WebSocket-Version") != "13"
+                        or not re.fullmatch(r"[A-Za-z0-9+/]{22}==", self.headers.get("Sec-WebSocket-Key", ""))
+                        or not any(value.strip() == "binary" for value in protocols)):
+                    self.send_error(403)
+                    return
+                try:
+                    identity, password = json.loads(self.server.credential_cipher.decrypt(secret))
+                    if identity != [ip, login, fingerprint]:
+                        raise ValueError
+                    vnc.relay_console(self, ip, login, fingerprint, password)
+                except (InvalidToken, OSError, ValueError, paramiko.SSHException):
+                    self.send_error(502, "Console unavailable")
+                return
+            body = vnc.console_page(name, ip).encode()
+            content_type = "text/html; charset=utf-8"
+            self.send_response(200)
+            websocket_origins = " ".join(sorted(
+                "wss://" + urlsplit(origin).netloc for origin in self.server.allowed_origins
+                if urlsplit(origin).scheme == "https"
+            ))
+            self.send_header("Content-Security-Policy",
+                             "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; "
+                             f"connect-src 'self' {websocket_origins}; img-src 'self' data:; frame-ancestors 'none'")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path == "/favicon.png":
             icon = Path(__file__).with_name("favicon.png").read_bytes()
@@ -512,6 +593,9 @@ class Panel(BaseHTTPRequestHandler):
             self.wfile.write(icon)
             return
         if not self.authorized():
+            return
+        if self.path.startswith(("/console/", "/novnc/")):
+            self.console()
             return
         if self.path == "/pi-fleet-ca.crt" and self.server.ca_path:
             body = self.server.ca_path.read_bytes()
@@ -680,10 +764,16 @@ class Panel(BaseHTTPRequestHandler):
             button.textContent = label;
           }}
         }});
-        document.addEventListener("change", event => {{
-          if (event.target.name === "network_mode") {{
-            event.target.form.querySelector("[data-static-network]").disabled = event.target.value !== "static";
-          }}
+        function updateInstallForm(form) {{
+          const raw = form.elements.image.selectedOptions[0]?.dataset.raw === "true";
+          const settings = form.querySelector("[data-os-settings]");
+          settings.hidden = settings.disabled = raw;
+          form.querySelector("[data-raw-note]").hidden = !raw;
+          form.querySelector("[data-static-network]").disabled = form.elements.network_mode.value !== "static";
+        }}
+        document.querySelectorAll('form[action="/reinstall"]').forEach(form => {{
+          updateInstallForm(form);
+          form.addEventListener("change", () => updateInstallForm(form));
         }});
         const filter = document.querySelector("#device-filter");
         filter.addEventListener("input", () => {{
@@ -800,7 +890,7 @@ class Panel(BaseHTTPRequestHandler):
                     vnc.install(ip, login, fingerprint, password, data.get("vnc_password", [""])[0])
                     with sqlite3.connect(self.server.database) as db:
                         db.execute("INSERT OR REPLACE INTO consoles VALUES (?,?)", (ip, f"vnc://{ip}:{vnc.PORT}"))
-                    output = f"VNC локальной консоли tty1 установлен: {ip}:{vnc.PORT}. Автозапуск включён. Пароль — тот, который вы указали в форме. Откройте VNC-клиент с поддержкой TLS/VeNCrypt, например TigerVNC. Это общий экран tty1 и общая клавиатура с подключённым монитором. Пока ОС не запущена, программный VNC недоступен; для EEPROM и аварийной загрузки используйте BliKVM. Если на Pi включён межсетевой экран, разрешите доступ к TCP {vnc.PORT} из вашей сети."
+                    output = "VNC локальной консоли tty1 установлен. Откройте «Консоль VNC» на карточке и введите заданный пароль."
                 elif checking:
                     cid, mac, budget, board = eeprom.provisioning_identity(
                         ip, login, fingerprint, password, getattr(self.server,"boot_host",urlsplit(self.server.origin).hostname),
@@ -846,12 +936,26 @@ class Panel(BaseHTTPRequestHandler):
             profiles = load_reinstall_networks(db, self.server.network)
         if not reinstall_profile(ip, self.server.network, profiles):
             return set()
-        if ip != self.server.test_pi:
-            with sqlite3.connect(self.server.database) as db:
-                if not db.execute("SELECT 1 FROM provisioning WHERE ip=?", (ip,)).fetchone():
-                    return set()
+        with sqlite3.connect(self.server.database) as db:
+            registered = db.execute("SELECT board,max_payload FROM provisioning WHERE ip=?", (ip,)).fetchone()
+        if not registered and ip != self.server.test_pi:
+            return set()
+        board, max_payload = registered or ("pi4b", None)
         directory = self.server.switch.directory
-        return {image for image in IMAGES if (directory / (image + ".ready")).is_file()}
+        available = set()
+        for image in IMAGES:
+            marker = directory / (image + ".ready")
+            if not supports_board(image, board) or not marker.is_file():
+                continue
+            if image in RAW_IMAGES:
+                try:
+                    packed_bytes = int(marker.read_text())
+                except (OSError, ValueError):
+                    continue
+                if packed_bytes <= 0 or (max_payload is not None and packed_bytes > max_payload):
+                    continue
+            available.add(image)
+        return available
 
     def do_POST(self):
         host = self.headers.get("Host", "")
@@ -999,22 +1103,25 @@ class Panel(BaseHTTPRequestHandler):
                 if not self.server.admin:
                     self.send_error(404)
                     return
-                hostname, login, password = (data[key][0] for key in ("hostname", "login", "password"))
-                if (not valid_account(hostname, login) or not 8 <= len(password) <= 128
-                        or any(ord(char) < 32 for char in password)):
-                    raise ValueError
+                image = data["image"][0] if self.path == "/reinstall" else "raspios-lite-arm64"
+                raw_image = image in RAW_IMAGES
+                hostname = login = password = hashed = ""
+                if not raw_image:
+                    hostname, login, password = (data[key][0] for key in ("hostname", "login", "password"))
+                    if (not valid_account(hostname, login) or not 8 <= len(password) <= 128
+                            or any(ord(char) < 32 for char in password)):
+                        raise ValueError
+                    hashed = subprocess.run(["openssl", "passwd", "-6", "-stdin"],
+                                            input=password + "\n", text=True, capture_output=True,
+                                            check=True, timeout=5).stdout.strip()
                 with sqlite3.connect(self.server.database) as db:
                     if not db.execute("SELECT 1 FROM devices WHERE ip=?", (str(ip),)).fetchone():
                         self.send_error(404)
                         return
-                hashed = subprocess.run(["openssl", "passwd", "-6", "-stdin"],
-                                        input=password + "\n", text=True, capture_output=True,
-                                        check=True, timeout=5).stdout.strip()
                 if self.path == "/reinstall":
-                    image = data["image"][0]
-                    network = installation_network(str(ip), data.get("network_mode", ["dhcp"])[0],
-                        data.get("address", [""])[0], data.get("prefix", ["24"])[0],
-                        data.get("gateway", [""])[0], data.get("dns", [""])[0])
+                    network = {} if raw_image else installation_network(
+                        str(ip), data.get("network_mode", ["dhcp"])[0], data.get("address", [""])[0],
+                        data.get("prefix", ["24"])[0], data.get("gateway", [""])[0], data.get("dns", [""])[0])
                     if image not in self.ready_images(str(ip)) or data["confirm"][0] != "yes":
                         raise ValueError
                     with self.server.device_lock(str(ip)):
@@ -1038,7 +1145,7 @@ class Panel(BaseHTTPRequestHandler):
                             db.execute("INSERT OR REPLACE INTO reinstall (id,ip,image,hostname,login,password_hash,status,network_json) VALUES (1, ?, ?, ?, ?, ?, 'queued', ?)",
                                        (str(ip), image, hostname, login, hashed, json.dumps(network)))
                             db.execute("DELETE FROM reinstall_ssh WHERE ip=?", (str(ip),))
-                            if self.server.credential_cipher and ip in self.server.network:
+                            if not raw_image and self.server.credential_cipher and ip in self.server.network:
                                 registered = db.execute("SELECT mac FROM provisioning WHERE ip=?", (str(ip),)).fetchone()
                                 if not registered and str(ip) == self.server.test_pi:
                                     seed = self.server.switch.directory / "install-device.json"

@@ -152,4 +152,4 @@ article .power button { padding:6px 9px; font-size:12px; }
   .device-dialog { padding:16px; }
 }
 
-#reinstall-networks textarea { display:block; width:100%; margin-top:6px; padding:9px; border:1px solid var(--border); border-radius:8px; font:inherit; resize:vertical; }
+#panel-settings textarea { display:block; width:100%; margin-top:6px; padding:9px; border:1px solid var(--border); border-radius:8px; font:inherit; resize:vertical; }

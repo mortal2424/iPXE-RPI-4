@@ -2,7 +2,7 @@
 Description=Renew Pi Fleet public TLS certificate
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=/etc/letsencrypt/renewal/pi.homevlad.ru.conf
+ConditionPathExists=/opt/pi-reinstall/.env
 [Service]
 Type=oneshot
 ExecStart=/opt/pi-fleet-acme/bin/certbot renew --quiet --deploy-hook /opt/pi-reinstall/ops/deploy-letsencrypt.sh

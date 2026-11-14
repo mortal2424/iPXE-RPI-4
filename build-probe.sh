@@ -3,6 +3,12 @@
 set -euo pipefail
 input=$(realpath "$1")
 output=$(realpath -m "$2")
+case "${PI_BOARD:-pi4b}" in
+    pi4b) board_dtb=bcm2711-rpi-4-b.dtb ;;
+    cm4) board_dtb=bcm2711-rpi-cm4.dtb ;;
+    *) echo "Unknown board: $PI_BOARD" >&2; exit 1 ;;
+esac
+test -s "$input/$board_dtb"
 work=$(mktemp -d)
 trap 'mountpoint -q "$work/fat" && umount "$work/fat"; rm -rf "$work"' EXIT
 mkdir -p "$work/root/run" "$work/fat" "$work/root/bin" "$work/root/dev" "$work/root/proc" "$work/root/sys"
@@ -37,10 +43,10 @@ fi
 truncate -s 32M "$output"
 mkfs.vfat "$output"
 mount -o loop "$output" "$work/fat"
-cp "$input"/{start4.elf,fixup4.dat,kernel8.img,bcm2711-rpi-4-b.dtb} "$work/fat/"
+cp "$input"/{start4.elf,fixup4.dat,kernel8.img} "$input/$board_dtb" "$work/fat/"
 cp "$work/probe.gz" "$work/fat/"
 if [ -n "${SD_MAX_HZ:-}" ]; then
-    dtb="$work/fat/bcm2711-rpi-4-b.dtb"
+    dtb="$work/fat/$board_dtb"
     controller=$(fdtget -t s "$dtb" /__symbols__ emmc2)
     fdtput -t u "$dtb" "$controller" max-frequency "$SD_MAX_HZ"
     fdtput "$dtb" "$controller" no-1-8-v

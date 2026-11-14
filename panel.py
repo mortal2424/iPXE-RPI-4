@@ -113,6 +113,47 @@ def restore_reinstalled_ssh(database, cipher, device_lock):
                     save_ssh(db, ip, login, fingerprint, private, cipher, password)
 
 
+def restart_for_installation(database, cipher):
+    with sqlite3.connect(database) as db:
+        job = db.execute("""
+            SELECT r.ip, r.restart_token, c.login, c.fingerprint, e.secret
+            FROM reinstall r LEFT JOIN collectors c USING(ip)
+            LEFT JOIN eeprom_credentials e USING(ip)
+            WHERE r.id=1 AND r.status='ssh_restart'
+        """).fetchone()
+    if not job:
+        return
+    ip, token, login, fingerprint, secret = job
+    pending = Path(database).with_name("jobs") / f"{token}.pending"
+    if not pending.is_file():
+        return
+    status = "restart_fallback"
+    if cipher and login and fingerprint and secret:
+        try:
+            identity, password = json.loads(cipher.decrypt(secret))
+            if identity == [ip, login, fingerprint]:
+                with telemetry.connect(ip, login, fingerprint, password=password) as client:
+                    if not pending.is_file():
+                        return
+                    eeprom.schedule_reboot(client, password, "pi-fleet-install-reboot")
+                status = "waiting"
+        except (InvalidToken, OSError, ValueError, paramiko.SSHException):
+            pass
+    with sqlite3.connect(database) as db:
+        db.execute("""UPDATE reinstall SET status=?,restart_token=NULL
+                      WHERE id=1 AND ip=? AND status='ssh_restart' AND restart_token=?""",
+                   (status, ip, token))
+
+
+def watch_installation_restarts(database, cipher):
+    while True:
+        try:
+            restart_for_installation(database, cipher)
+        except (sqlite3.Error, OSError) as error:
+            print(f"Installation restart: {type(error).__name__}", flush=True)
+        time.sleep(2)
+
+
 def monitor(database, cipher, device_lock):
     while True:
         try:
@@ -122,6 +163,34 @@ def monitor(database, cipher, device_lock):
         except (sqlite3.Error, OSError) as error:
             print(f"Monitoring: {error}", flush=True)
         time.sleep(30)
+
+
+def panel_preferences(db, server):
+    row = db.execute("SELECT data FROM panel_preferences WHERE id=1").fetchone()
+    defaults_file = server.switch.directory / "network-defaults.json"
+    defaults = {"prefix": server.network.prefixlen, "gateway": "", "dns": "", "mode": "static"}
+    if defaults_file.is_file():
+        defaults.update(json.loads(defaults_file.read_text()))
+    defaults.update(json.loads(row[0]) if row else {})
+    return defaults
+
+
+def parse_panel_preferences(data, network):
+    mode = data.get("mode", ["static"])[0]
+    prefix = int(data.get("prefix", [str(network.prefixlen)])[0])
+    gateway = data.get("gateway", [""])[0].strip()
+    dns = data.get("dns", [""])[0].replace(",", " ").split()
+    management = [ipaddress.IPv4Network(value) for value in
+                  re.split(r"[\s,]+", data.get("management", [""])[0].strip()) if value]
+    if mode not in ("static", "dhcp") or not 1 <= prefix <= 30 or len(dns) > 3:
+        raise ValueError("Проверьте режим сети, префикс и список DNS.")
+    addresses = [ipaddress.IPv4Address(value) for value in ([gateway] if gateway else []) + dns]
+    if any(address.is_loopback or address.is_unspecified or address.is_multicast for address in addresses):
+        raise ValueError("Укажите действительные IPv4-адреса шлюза и DNS.")
+    if any(not 1 <= subnet.prefixlen <= 30 or subnet.is_loopback or subnet.is_multicast for subnet in management):
+        raise ValueError("Укажите подсети управления в формате CIDR.")
+    return {"mode": mode, "prefix": prefix, "gateway": gateway, "dns": " ".join(dns),
+            "management": list(dict.fromkeys(map(str, management)))}
 
 
 def installation_status(database, ip, legacy_ip):
@@ -301,7 +370,7 @@ def render_card(device, samples, metrics, history, installer, power, admin, read
         f'<span class="{"good" if status else "bad"}" title="{datetime.fromtimestamp(at).astimezone():%d.%m %H:%M %Z} · {"доступен" if status else "недоступен"}"></span>'
         for at, status in reversed(samples)
     )
-    status = f'<div class="job install-status"><b>Переустановка</b><span>{installer}</span></div>' if installer else ""
+    status = f'<div class="job install-status"{" hidden" if not installer else ""}><b>Переустановка</b><span>{installer or ""}</span></div>'
     available = {key: label for key, label in IMAGES.items() if key in ready_images}
     install = f"""
       <details><summary>Настройки новой ОС</summary>
@@ -311,18 +380,18 @@ def render_card(device, samples, metrics, history, installer, power, admin, read
           <label>Имя хоста<input name="hostname" required maxlength="63"></label>
           <label>Логин<input name="login" required maxlength="32"></label>
           <label>Пароль<input type="password" name="password" required minlength="8" maxlength="128" autocomplete="new-password"></label>
-          <label>Сеть новой ОС<select name="network_mode"><option value="static" selected>Статический IP из карточки</option><option value="dhcp">DHCP</option></select></label>
-          <fieldset data-static-network>
+          <label>Сеть новой ОС<select name="network_mode">{options({"static": "Статический IP из карточки", "dhcp": "DHCP"}, network_defaults.get("mode", "static"))}</select></label>
+          <fieldset data-static-network{" disabled" if network_defaults.get("mode") == "dhcp" else ""}>
             <label>IP-адрес<input name="address" value="{ip}" readonly></label>
             <label>Префикс сети<input name="prefix" type="number" min="1" max="30" required value="{network_defaults.get('prefix',24)}"></label>
-            <label>Шлюз<input name="gateway" required value="{escape(network_defaults.get('gateway',''),quote=True)}" placeholder="192.168.10.1"></label>
-            <label>DNS (через пробел)<input name="dns" required value="{escape(network_defaults.get('dns',''),quote=True)}" placeholder="192.168.10.1"></label>
+            <label>Шлюз<input name="gateway" required value="{escape(network_defaults.get('gateway',''),quote=True)}" placeholder="192.0.2.1"></label>
+            <label>DNS (через пробел)<input name="dns" required value="{escape(network_defaults.get('dns',''),quote=True)}" placeholder="192.0.2.1"></label>
           </fieldset>
           <label class="confirm"><input type="checkbox" name="confirm" value="yes" required>
           Разрешаю стереть SD-карту {escape(name)} и перезапустить Pi</label>
           <button {"disabled" if not available else ""}>Переустановить ОС</button>
         </form>
-      </details>""" if admin and ready_images else '<small>Для переустановки нужны зарегистрированная SD-карта и настроенный PoE.</small>' if admin else ""
+      </details>""" if admin and ready_images else '<small>Для переустановки проверьте готовность Pi и зарегистрируйте SD-карту.</small>' if admin else ""
     edit = f"""
       <details><summary>Редактировать карточку</summary>
         <form method="post" action="/devices/edit">
@@ -350,6 +419,7 @@ def render_card(device, samples, metrics, history, installer, power, admin, read
           <label>Новый порядок загрузки<select name="profile">{options(boot_choices, "http-sd")}</select></label>
           <label class="confirm"><input type="checkbox" name="confirm" value="yes" required>
           Применить выбранный порядок загрузки и перезагрузить Pi</label>
+          <button class="secondary" formaction="/eeprom/check" formnovalidate>Проверить возможность записи</button>
           <button>Настроить EEPROM и перезагрузить</button>
         </form>
       </details>""" if admin and eeprom_key and has_eeprom_access else ""
@@ -475,28 +545,26 @@ class Panel(BaseHTTPRequestHandler):
             }
             collector_devices = {row[0] for row in db.execute("SELECT ip FROM collectors")}
             reinstall_networks = load_reinstall_networks(db, self.server.network)
+            network_defaults = panel_preferences(db, self.server)
             provisioned_devices = {row[0] for row in db.execute("SELECT ip FROM provisioning")}
             consoles = dict(db.execute("SELECT ip,url FROM consoles"))
             eeprom_devices = {row[0] for row in db.execute("SELECT ip FROM eeprom_credentials")}
         up = sum(bool(history and history[0][1]) for history in samples.values())
         down = sum(bool(history and not history[0][1]) for history in samples.values())
-        defaults_file = self.server.switch.directory / "network-defaults.json"
-        network_defaults = {"prefix": self.server.network.prefixlen}
-        if defaults_file.is_file():
-            network_defaults.update(json.loads(defaults_file.read_text()))
         def device_network_defaults(ip):
             profile = reinstall_profile(ip, self.server.network, reinstall_networks)
             if profile and profile[1]:
                 subnet, gateway = profile
-                return {"prefix": subnet.prefixlen, "gateway": str(gateway), "dns": str(gateway)}
+                return {**network_defaults, "prefix": subnet.prefixlen, "gateway": str(gateway),
+                        "dns": network_defaults["dns"] or str(gateway)}
             return network_defaults
 
         rows = "".join(
-            render_card(device, samples[device[0]], metrics[device[0]], history[device[0]], installation_status(self.server.database, device[0], self.server.test_pi), render_power(self.server, device[0], device[4]), self.server.admin, self.ready_images(device[0]) if device[4] is not None and device[5] and self.server.switch.ports.get(device[0], (None,))[0] == device[4] and self.server.switch.allow_write else set(), self.eeprom_key().is_file(), bool(self.server.credential_cipher and device[0] in eeprom_devices), device[0] in collector_devices, device[0] in provisioned_devices, consoles.get(device[0], ""), device_network_defaults(device[0]))
+            render_card(device, samples[device[0]], metrics[device[0]], history[device[0]], installation_status(self.server.database, device[0], self.server.test_pi), render_power(self.server, device[0], device[4]), self.server.admin, self.ready_images(device[0]) if device[5] else set(), self.eeprom_key().is_file(), bool(self.server.credential_cipher and device[0] in eeprom_devices), device[0] in collector_devices, device[0] in provisioned_devices, consoles.get(device[0], ""), device_network_defaults(device[0]))
             for device in devices
         )
         enroll_fields = """
-        <label>SSH-логин<input name="login" autocomplete="username" placeholder="mortal"></label>
+        <label>SSH-логин<input name="login" autocomplete="username" placeholder="pi-admin"></label>
         <label>Пароль SSH<input type="password" name="password" autocomplete="current-password"></label>
         <label class="wide">Отпечаток ключа Pi<input name="fingerprint" placeholder="SHA256:…"></label>
         <small class="wide">Для сбора метрик заполните все три поля SSH. Для карточки без метрик оставьте их пустыми.</small>
@@ -508,13 +576,25 @@ class Panel(BaseHTTPRequestHandler):
         action = "/devices"
         label = "Добавить"
         hint = "" if self.server.admin else "<p>Для подключения метрик откройте защищённую панель по HTTPS.</p>"
-        network_button = '<button class="secondary" data-dialog="reinstall-networks">Сети переустановки</button>' if self.server.admin else ""
+        network_button = '<button class="secondary" data-dialog="panel-settings">Настройки панели</button>' if self.server.admin else ""
         network_lines = "\n".join(f"{network} {gateway}" for network, gateway in reinstall_networks.items())
-        network_dialog = f'''<dialog id="reinstall-networks" class="device-dialog">
-        <div class="dialog-head"><h2>Сети переустановки</h2><button class="secondary" data-close-dialog aria-label="Закрыть">×</button></div>
-        <p>Основная сеть {self.server.network} включена всегда. Для каждой дополнительной сети укажите CIDR и шлюз через пробел. Из этой сети Raspberry Pi должна видеть загрузочный сервер на TCP 8083.</p>
-        <form method="post" action="/reinstall-networks">
-        <label>Дополнительные сети<textarea name="networks" rows="5" maxlength="800" placeholder="192.168.89.0/24 192.168.89.1">{escape(network_lines)}</textarea></label>
+        management = ", ".join(network_defaults.get("management", map(str, self.server.management_networks)))
+        network_dialog = f'''<dialog id="panel-settings" class="device-dialog">
+        <div class="dialog-head"><h2>Настройки панели</h2><button class="secondary" data-close-dialog aria-label="Закрыть">×</button></div>
+        <form method="post" action="/panel-settings">
+        <fieldset><legend>Сети устройств</legend>
+        <label>Дополнительные сети управления<input name="management" maxlength="800" placeholder="198.51.100.0/24" value="{escape(management, quote=True)}"></label>
+        <label>Дополнительные сети переустановки<textarea name="networks" rows="4" maxlength="800" placeholder="198.51.100.0/24 198.51.100.1">{escape(network_lines)}</textarea></label>
+        <small>Одна подсеть CIDR и её шлюз на строку. Основная сеть {self.server.network} включена всегда.</small>
+        </fieldset>
+        <fieldset><legend>Настройки новой ОС по умолчанию</legend>
+        <label>Режим IPv4<select name="mode">{options({"static": "Статический IP из карточки", "dhcp": "DHCP"}, network_defaults["mode"])}</select></label>
+        <label>Префикс<input name="prefix" type="number" min="1" max="30" required value="{escape(str(network_defaults["prefix"]), quote=True)}"></label>
+        <label>Шлюз<input name="gateway" maxlength="15" value="{escape(network_defaults["gateway"], quote=True)}"></label>
+        <label>DNS-серверы<input name="dns" maxlength="50" value="{escape(network_defaults["dns"], quote=True)}"></label>
+        </fieldset>
+        <p>Панель: {escape(self.server.origin)}. Загрузочный сервер: {escape(self.server.boot_host)}:8083.
+        Адреса, TLS и параметры SNMP задаются на сервере.</p>
         <button>Сохранить</button></form></dialog>''' if self.server.admin else ""
         html = f"""<!doctype html>
         <html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -529,7 +609,7 @@ class Panel(BaseHTTPRequestHandler):
         <div class="grid">{rows or '<p>Устройства ещё не добавлены.</p>'}</div>
         <dialog id="add-device" class="device-dialog add-device-dialog"><div class="dialog-head"><div><h2>Добавить Raspberry Pi</h2><small>Устройство, сеть и доступ SSH</small></div><button class="secondary" data-close-dialog aria-label="Закрыть">×</button></div>{hint}<form class="add-device-form" method="post" action="{action}">
         <label>Имя<input name="name" required maxlength="60" placeholder="pi-lab-02"></label>
-        <label>IPv4<input name="ip" required placeholder="192.168.10.250"></label>
+        <label>IPv4<input name="ip" required placeholder="192.0.2.20"></label>
         <label>Порт коммутатора (необязательно)<input name="port" type="number" min="1" max="24" step="1" placeholder="19"></label>
         {('<label>CID SD-карты (необязательно)<input name="cid" pattern="[a-fA-F0-9]{32}" maxlength="32"></label><small>На Pi: cat /sys/block/mmcblk0/device/cid</small>') if self.server.admin else ""}
         {enroll_fields}
@@ -559,24 +639,24 @@ class Panel(BaseHTTPRequestHandler):
         }}
         document.addEventListener("submit", async (event) => {{
           const form = event.target;
-          if (!["/devices", "/reinstall-networks", "/eeprom", "/provision/check", "/devices/access", "/vnc/install"].includes(form.getAttribute("action"))) return;
+          if (!["/devices", "/panel-settings", "/eeprom", "/provision/check", "/devices/access", "/vnc/install"].includes(form.getAttribute("action"))) return;
           event.preventDefault();
           const button = event.submitter || form.querySelector('button:not([formaction])');
           const action = button.getAttribute("formaction") || form.getAttribute("action");
           const installingVnc = action === "/vnc/install";
-          const reading = action === "/eeprom/read";
+          const reading = action === "/eeprom/read" || action === "/eeprom/check";
           const savingAccess = action === "/devices/access";
           const checking = action === "/provision/check";
           if (form.dataset.busy) return;
           form.dataset.busy = "yes";
           const label = button.textContent;
           button.disabled = true;
-          button.textContent = action === "/devices" ? "Добавляем Pi…" : action === "/reinstall-networks" ? "Сохраняем сети…" : installingVnc ? "Устанавливаем VNC…" : savingAccess ? "Сохраняем доступ…" : reading ? "Читаем настройки…" : checking ? "Проверяем Pi…" : "Подготавливаем EEPROM…";
+          button.textContent = action === "/devices" ? "Добавляем Pi…" : action === "/panel-settings" ? "Сохраняем настройки…" : installingVnc ? "Устанавливаем VNC…" : savingAccess ? "Сохраняем доступ…" : reading ? "Читаем настройки…" : checking ? "Проверяем Pi…" : "Подготавливаем EEPROM…";
           try {{
             const response = await fetch(action, {{
               method: "POST", body: new URLSearchParams(new FormData(form)), cache: "no-store",
             }});
-            if (["/devices", "/reinstall-networks"].includes(action) && response.redirected && response.ok) {{
+            if (["/devices", "/panel-settings"].includes(action) && response.redirected && response.ok) {{
               location.assign(response.url);
               return;
             }}
@@ -585,7 +665,7 @@ class Panel(BaseHTTPRequestHandler):
               if (!reading && !checking && !savingAccess && !installingVnc) {{
                 form.querySelector('input[name="confirm"]').checked = false;
               }}
-              showResult(installingVnc ? "VNC установлен" : savingAccess ? "Доступ сохранён" : reading ? "Текущие настройки загрузчика" : checking ? "Pi готова к переустановке" : "Перезагрузка запланирована", body);
+              showResult(installingVnc ? "VNC установлен" : savingAccess ? "Доступ сохранён" : reading ? (action === "/eeprom/check" ? "Проверка EEPROM" : "Текущие настройки загрузчика") : checking ? "Pi готова к переустановке" : "Перезагрузка запланирована", body);
               if (checking || savingAccess || installingVnc) result.addEventListener("close", () => location.reload(), {{once:true}});
             }} else {{
               const paragraphs = new DOMParser().parseFromString(body, "text/html").querySelectorAll("p");
@@ -685,9 +765,11 @@ class Panel(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         reading = self.path == "/eeprom/read"
+        checking_eeprom = self.path == "/eeprom/check"
         checking = self.path == "/provision/check"
         profile = data.get("profile", ["http-sd"])[0]
-        if not reading and not checking and not installing_vnc and (data["confirm"][0] != "yes" or profile not in eeprom.BOOT_ORDERS):
+        if not reading and not checking and not installing_vnc and (
+                profile not in eeprom.BOOT_ORDERS or (not checking_eeprom and data.get("confirm", [""])[0] != "yes")):
             raise ValueError
         with self.server.device_lock(ip):
             if not reading and install_busy(self.server.database, ip, self.server.test_pi):
@@ -720,28 +802,28 @@ class Panel(BaseHTTPRequestHandler):
                         db.execute("INSERT OR REPLACE INTO consoles VALUES (?,?)", (ip, f"vnc://{ip}:{vnc.PORT}"))
                     output = f"VNC локальной консоли tty1 установлен: {ip}:{vnc.PORT}. Автозапуск включён. Пароль — тот, который вы указали в форме. Откройте VNC-клиент с поддержкой TLS/VeNCrypt, например TigerVNC. Это общий экран tty1 и общая клавиатура с подключённым монитором. Пока ОС не запущена, программный VNC недоступен; для EEPROM и аварийной загрузки используйте BliKVM. Если на Pi включён межсетевой экран, разрешите доступ к TCP {vnc.PORT} из вашей сети."
                 elif checking:
-                    cid, mac, budget = eeprom.provisioning_identity(
+                    cid, mac, budget, board = eeprom.provisioning_identity(
                         ip, login, fingerprint, password, getattr(self.server,"boot_host",urlsplit(self.server.origin).hostname),
                     )
                     with sqlite3.connect(self.server.database) as db:
-                        port, saved_cid = db.execute("SELECT physical_port,sd_cid FROM devices WHERE ip=?", (ip,)).fetchone()
-                        mapping = self.server.switch.ports.get(ip)
-                        if not self.server.switch.allow_write or not mapping or mapping[0] != port:
-                            raise ValueError("Сначала зарегистрируйте PoE-порт в карточке.")
+                        saved_cid, = db.execute("SELECT sd_cid FROM devices WHERE ip=?", (ip,)).fetchone()
                         if saved_cid and saved_cid != cid:
                             raise ValueError("CID в карточке отличается от вставленной SD-карты.")
                         db.execute("UPDATE devices SET sd_cid=? WHERE ip=?", (cid, ip))
-                        db.execute("INSERT OR REPLACE INTO provisioning VALUES (?,?,?)", (ip, mac, budget))
-                    output = "Проверены Ethernet, настройки загрузчика, SD-карта и привязка PoE. Обновите карточку, чтобы выбрать ОС."
+                        db.execute("INSERT OR REPLACE INTO provisioning (ip,mac,max_payload,board) VALUES (?,?,?,?)", (ip, mac, budget, board))
+                    output = "Проверены Ethernet, настройки загрузчика и SD-карта. Обновите карточку, чтобы выбрать ОС."
                 elif reading:
                     output = eeprom.read_settings(ip, login, fingerprint, password)
                 else:
                     eeprom.stage(ip, login, fingerprint, password,
-                                 getattr(self.server,"boot_host",urlsplit(self.server.origin).hostname), self.eeprom_key(), profile)
-                    with sqlite3.connect(self.server.database) as db:
-                        db.execute("DELETE FROM provisioning WHERE ip=?", (ip,))
+                                 getattr(self.server,"boot_host",urlsplit(self.server.origin).hostname), self.eeprom_key(), profile, check_only=checking_eeprom)
                     label = eeprom.BOOT_ORDERS[profile][0]
-                    output = f"Порядок «{label}» подготовлен. Pi перезагрузится примерно через 10 секунд."
+                    if checking_eeprom:
+                        output = f"Образ EEPROM для «{label}» успешно собран. Запись не запускалась."
+                    else:
+                        with sqlite3.connect(self.server.database) as db:
+                            db.execute("DELETE FROM provisioning WHERE ip=?", (ip,))
+                        output = f"Порядок «{label}» подготовлен. Pi перезагрузится примерно через 10 секунд."
             except ValueError as error:
                 self.send_error(422, "Device configuration check failed", str(error))
                 return
@@ -785,17 +867,20 @@ class Panel(BaseHTTPRequestHandler):
             if not 0 < length <= 4096:
                 raise ValueError
             data = parse_qs(self.rfile.read(length).decode(), max_num_fields=20)
-            if self.path == "/reinstall-networks":
-                self.save_reinstall_networks(data.get("networks", [""])[0])
+            if self.path in ("/panel-settings", "/reinstall-networks"):
+                self.save_panel_settings(data)
                 return
             with sqlite3.connect(self.server.database) as db:
                 profiles = load_reinstall_networks(db, self.server.network)
+                management = panel_preferences(db, self.server).get("management")
             try:
                 ip = ipaddress.IPv4Address(data["ip"][0].strip())
             except (KeyError, ValueError):
                 self.send_error(400, "Invalid IPv4 address", "Укажите корректный IPv4-адрес устройства.")
                 return
-            networks = (self.server.network, *getattr(self.server, "management_networks", ()), *profiles)
+            management = (self.server.management_networks if management is None
+                          else tuple(map(ipaddress.IPv4Network, management)))
+            networks = (self.server.network, *management, *profiles)
             if not any(ip in network and ip not in (network.network_address, network.broadcast_address)
                        for network in networks):
                 self.send_error(400, "Address outside fleet networks",
@@ -841,7 +926,7 @@ class Panel(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path in ("/eeprom", "/eeprom/read", "/provision/check", "/vnc/install"):
+            if self.path in ("/eeprom", "/eeprom/read", "/eeprom/check", "/provision/check", "/vnc/install"):
                 self.do_eeprom(str(ip), data)
                 return
             if self.path in ("/devices", "/enroll", "/devices/edit"):
@@ -946,10 +1031,9 @@ class Panel(BaseHTTPRequestHandler):
                                                      load_reinstall_networks(db, self.server.network)):
                                 self.send_error(422, "Boot network required", "Подсеть Pi не разрешена для переустановки.")
                                 return
-                            device = db.execute("SELECT physical_port, sd_cid FROM devices WHERE ip=?", (str(ip),)).fetchone()
-                            mapping = self.server.switch.ports.get(str(ip))
-                            if not device or not device[1] or not self.server.switch.allow_write or not mapping or device[0] != mapping[0]:
-                                self.send_error(409, "Register the SD card and verify the PoE port first")
+                            device = db.execute("SELECT sd_cid FROM devices WHERE ip=?", (str(ip),)).fetchone()
+                            if not device or not device[0]:
+                                self.send_error(409, "Register the SD card first")
                                 return
                             db.execute("INSERT OR REPLACE INTO reinstall (id,ip,image,hostname,login,password_hash,status,network_json) VALUES (1, ?, ?, ?, ?, ?, 'queued', ?)",
                                        (str(ip), image, hostname, login, hashed, json.dumps(network)))
@@ -1007,14 +1091,16 @@ class Panel(BaseHTTPRequestHandler):
             return
         self.redirect()
 
-    def save_reinstall_networks(self, value):
+    def save_panel_settings(self, data):
         if not self.server.admin:
             self.send_error(404)
             return
         try:
-            profiles = parse_reinstall_networks(value, self.server.network)
+            profiles = parse_reinstall_networks(data.get("networks", [""])[0], self.server.network)
+            preferences = (parse_panel_preferences(data, self.server.network)
+                           if self.path == "/panel-settings" else None)
         except ValueError as error:
-            self.send_error(400, "Invalid installation networks", str(error))
+            self.send_error(400, "Invalid panel settings", str(error))
             return
         with sqlite3.connect(self.server.database) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1025,6 +1111,8 @@ class Panel(BaseHTTPRequestHandler):
             db.execute("DELETE FROM reinstall_networks")
             db.executemany("INSERT INTO reinstall_networks VALUES (?,?)",
                            [(str(network), str(gateway)) for network, gateway in profiles.items()])
+            if preferences is not None:
+                db.execute("INSERT OR REPLACE INTO panel_preferences VALUES (1,?)", (json.dumps(preferences),))
         self.redirect()
 
     def add_device(self, ip, data, port, cid):
@@ -1079,6 +1167,7 @@ if __name__ == "__main__":
                                 for value in args.management_networks.split(",") if value.strip())
     with sqlite3.connect(args.database) as db:
         schema(db)
+        db.execute("CREATE TABLE IF NOT EXISTS panel_preferences (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS consoles (ip TEXT PRIMARY KEY, url TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS eeprom_credentials (ip TEXT PRIMARY KEY, secret BLOB NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS poe_registrations (ip TEXT PRIMARY KEY, port INTEGER NOT NULL, switch_target TEXT NOT NULL)")
@@ -1156,6 +1245,7 @@ if __name__ == "__main__":
     if args.admin_port and not args.https_origin:
         admin = create_server(args.admin_port, f"http://127.0.0.1:{args.admin_port}", True)
         threading.Thread(target=admin.serve_forever, daemon=True).start()
+    threading.Thread(target=watch_installation_restarts, args=(args.database, cipher), daemon=True).start()
     threading.Thread(target=monitor, args=(args.database, cipher, device_lock), daemon=True).start()
     with create_server(args.port, args.origin, False) as server:
         server.serve_forever()

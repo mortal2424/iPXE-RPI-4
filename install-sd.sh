@@ -13,6 +13,14 @@ fail() {
     exit 1
 }
 
+case "${PI_BOARD:-pi4b}" in
+    pi4b) compatible=raspberrypi,4-model-b ;;
+    cm4) compatible=raspberrypi,4-compute-module ;;
+    *) fail "Unsupported board" ;;
+esac
+"$bb" tr '\000' '\n' </proc/device-tree/compatible |
+    "$bb" grep -Fx "$compatible" >/dev/null || fail "Board identity mismatch"
+
 for attempt in $("$bb" seq 1 30); do
     if [ -b "$disk" ] && [ -r /sys/block/mmcblk0/device/cid ] && [ -r /sys/class/net/eth0/address ]; then
         break

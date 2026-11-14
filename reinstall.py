@@ -12,16 +12,20 @@ import tempfile
 import time
 from pathlib import Path
 
-from poe import Switch
+from poe import PoeError, Switch
 
 IMAGES = {
     "raspios-lite-arm64": "Raspberry Pi OS Lite · 64-bit",
     "ubuntu-server-24.04": "Ubuntu Server 24.04 LTS · 64-bit",
 }
-ACTIVE = ("queued", "preparing", "waiting", "writing", "uncertain")
+ACTIVE = ("queued", "preparing", "ssh_restart", "restart_fallback", "manual_restart", "waiting", "writing", "uncertain")
 STATES = {
     "queued": "В очереди",
     "preparing": "Подготовка образа",
+    "ssh_restart": "Установщик готов. Проверяем возможность перезапуска по SSH.",
+    "restart_fallback": "Перезапуск по SSH недоступен. Проверяем управление питанием.",
+    "manual_restart": "Установщик готов. Сейчас выключите и снова включите питание Pi вручную.",
+    "restart_timeout": "Pi не загрузила установщик вовремя. Запустите переустановку заново.",
     "waiting": "Ожидание загрузки установщика",
     "writing": "Запись или проверка SD",
     "complete": "Образ записан и проверен",
@@ -32,6 +36,8 @@ STATES = {
 
 def schema(db):
     db.execute("CREATE TABLE IF NOT EXISTS provisioning (ip TEXT PRIMARY KEY, mac TEXT NOT NULL, max_payload INTEGER NOT NULL)")
+    if "board" not in {row[1] for row in db.execute("PRAGMA table_info(provisioning)")}:
+        db.execute("ALTER TABLE provisioning ADD COLUMN board TEXT NOT NULL DEFAULT 'pi4b'")
     db.execute("""CREATE TABLE IF NOT EXISTS reinstall (
         id INTEGER PRIMARY KEY CHECK(id=1), ip TEXT NOT NULL, image TEXT NOT NULL,
         hostname TEXT NOT NULL, login TEXT NOT NULL, password_hash TEXT NOT NULL,
@@ -40,6 +46,9 @@ def schema(db):
 
     if "network_json" not in {row[1] for row in db.execute("PRAGMA table_info(reinstall)")}:
         db.execute("ALTER TABLE reinstall ADD COLUMN network_json TEXT NOT NULL DEFAULT '{}'")
+
+    if "restart_token" not in {row[1] for row in db.execute("PRAGMA table_info(reinstall)")}:
+        db.execute("ALTER TABLE reinstall ADD COLUMN restart_token TEXT")
 
     db.execute("""CREATE TABLE IF NOT EXISTS reinstall_ssh (
         ip TEXT PRIMARY KEY, login TEXT NOT NULL, secret BLOB NOT NULL,
@@ -215,19 +224,33 @@ def personalize(source, raw, user_data, mountpoint, network_data=None):
         run("losetup", "-d", loop)
 
 
+def restart_poe(db, state, ip, port, pending):
+    if port is None or not pending.is_file():
+        return False
+    try:
+        switch = Switch(state / "switch")
+        switch.load_registrations(db)
+        if switch.allow_write and switch.ports.get(ip, (None,))[0] == port and pending.is_file():
+            switch.restart(ip)
+            return True
+    except (OSError, ValueError, KeyError, PoeError) as error:
+        print(f"PoE restart unavailable: {type(error).__name__}", flush=True)
+    return False
+
+
 def process(db, base, state, settings, request):
     ip, image, hostname, login, password_hash, *extra = request
     network = json.loads(extra[0]) if extra else {}
-    registered = db.execute("SELECT mac,max_payload FROM provisioning WHERE ip=?", (ip,)).fetchone()
+    registered = db.execute("SELECT mac,max_payload,board FROM provisioning WHERE ip=?", (ip,)).fetchone()
     if registered:
-        mac, max_payload = registered
+        mac, max_payload, board = registered
     elif ip == str(ipaddress.IPv4Address(settings["ip"])):
-        mac, max_payload = settings["mac"], int(settings["max_payload_bytes"])
+        mac, max_payload, board = settings["mac"], int(settings["max_payload_bytes"]), "pi4b"
     else:
         raise ValueError("Pi is not registered for installation")
     device = db.execute("SELECT physical_port, sd_cid FROM devices WHERE ip=?", (ip,)).fetchone()
-    if not device or device[0] is None or not device[1]:
-        raise ValueError("SD card or verified port not registered")
+    if not device or not device[1]:
+        raise ValueError("SD card not registered")
     port, cid = device
     if not re.fullmatch(r"[a-f0-9]{32}", cid) or not re.fullmatch(r"(?:[a-f0-9]{2}:){5}[a-f0-9]{2}", mac):
         raise ValueError("Invalid device identity")
@@ -238,10 +261,10 @@ def process(db, base, state, settings, request):
         raise ValueError("Pi is outside the allowed installation networks")
     subnet, gateway = profile
     address = ipaddress.IPv4Interface(f"{ip}/{subnet.prefixlen}")
-    switch = Switch(state / "switch")
-    switch.load_registrations(db)
-    if not switch.allow_write or switch.ports.get(ip, (None,))[0] != port:
-        raise ValueError("No verified PoE control for this device")
+    if board not in ("pi4b", "cm4"):
+        raise ValueError("Unsupported installer board")
+    if board == "cm4" and not (base / "build/bcm2711-rpi-cm4.dtb").is_file():
+        raise ValueError("CM4 device tree is missing from the installer")
     source = base / "images" / (image + ".img.xz")
     config = cloud_config(image, hostname, login, password_hash)
     network_data = network_config(image, mac, network, ip) if network else None
@@ -256,11 +279,12 @@ def process(db, base, state, settings, request):
 
     def status(value):
         with db:
-            db.execute("UPDATE reinstall SET status=?, password_hash='' WHERE id=1", (value,))
+            db.execute("UPDATE reinstall SET status=?, password_hash='', restart_token=? WHERE id=1",
+                       (value, token if value == "ssh_restart" else None))
             if value == "complete":
                 db.execute("UPDATE reinstall_ssh SET expires=? WHERE ip=?",
                            (int(time.time()) + 3600, ip))
-            elif value in ("failed", "uncertain"):
+            elif value in ("failed", "uncertain", "restart_timeout"):
                 db.execute("DELETE FROM reinstall_ssh WHERE ip=?", (ip,))
 
     if (publish / "boot.sig").exists():
@@ -277,7 +301,7 @@ def process(db, base, state, settings, request):
                 raise ValueError("Selected image exceeds the registered Pi RAM budget")
             installer = work / "install.conf"
             installer.write_text(
-                f"SD_CID={cid}\nPI_MAC={mac}\nPI_ADDRESS={address}\n"
+                f"SD_CID={cid}\nPI_MAC={mac}\nPI_ADDRESS={address}\nPI_BOARD={board}\n"
                 f"BOOT_SERVER={server}\nPI_GATEWAY={gateway or ''}\n"
                 f"IMAGE_URL=http://{server}:8083/images/reinstall.img.xz\n"
                 f"CLAIM_URL=http://{server}:8083/claim\n"
@@ -286,7 +310,7 @@ def process(db, base, state, settings, request):
                 f"IMAGE_BYTES={raw.stat().st_size}\nPAYLOAD_BYTES={packed.stat().st_size}\nJOB_TOKEN={token}\n"
             )
             run("bash", base / "build-probe.sh", base / "build", work / "boot.img", installer,
-                env={**os.environ, "SD_MAX_HZ": "25000000"})
+                env={**os.environ, "SD_MAX_HZ": "25000000", "PI_BOARD": board})
             run("bash", base / "build/rpi-eeprom-digest", "-i", work / "boot.img", "-o",
                 work / "boot.sig", "-k", base / "build/signing.pem")
             run("install", "-m", "0644", packed, payload)
@@ -296,16 +320,19 @@ def process(db, base, state, settings, request):
             target.write_text(ip + "\n")
             run("install", "-m", "0644", target, publish / "target.ip")
             run("install", "-m", "0644", work / "boot.sig", publish / "boot.sig")
-        status("waiting")
-        switch.restart(ip)
-        deadline = time.monotonic() + 300
+        status("ssh_restart")
+        deadline = time.monotonic() + 600
         while time.monotonic() < deadline and not claimed.exists():
+            current = db.execute("SELECT status FROM reinstall WHERE id=1").fetchone()[0]
+            if current == "restart_fallback":
+                status("manual_restart" if not restart_poe(db, state, ip, port, pending) else "waiting")
             time.sleep(1)
         if not claimed.exists():
             pending.unlink(missing_ok=True)
         claim_consumed = claimed.exists()
         if not claim_consumed:
-            raise TimeoutError("Pi did not claim the installation")
+            status("restart_timeout")
+            return
         (publish / "boot.sig").unlink(missing_ok=True)
         status("writing")
         deadline = time.monotonic() + 1800
